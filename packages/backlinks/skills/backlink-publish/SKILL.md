@@ -1,0 +1,281 @@
+---
+name: backlink-publish
+description: 执行或继续 supermanager 外链发布批次：选择批次、领取租约、用专用持久浏览器发布、cloud-mail 邮箱验证、公开链接核验、结果回写、来源标签和互链徽标。适用于用户要求实际发外链、跑批次、重试已解除阻碍的条目；Google 登录准备由 google-session 技能处理。
+user-invocable: true
+---
+
+# 外链发布（backlink-publish）
+
+使用本插件的 `backlinks`、`backlinks_browser` 和只读 `backlinks_status` 工具执行发布。名称可能由 ZCode MCP 宿主加命名空间，按本次实际发现的工具调用；下文 JSON 是对应工具的参数，不是 Shell 命令。没有实际工具时先报告插件或配置缺失，不臆造工具、不以直接调用生产 API 绕开宿主。
+
+完整浏览器契约见 [浏览器操作说明](../../docs/browser.md)。开始前用 `backlinks_status` 检查所需服务；以返回的 `mailbox.configured`、`mailbox.defaultDomain` 和 `mailbox.domainSource` 判断邮箱配置。当前外链生产部署必须确认 `mailbox.defaultDomain` 为 `screwdom.org`；不能把 Cloud Mail 返回列表的首个候选域名当作生产注册域名。状态不创建邮箱、不证明创建权限或收信已验证，也不返回 token。浏览器只在需要时启动；API token、Google 密码、Cookie 均不写入提示词、证据或提交资料。
+
+配置只通过 `backlinks_status` 和「连接与浏览器」设置读取或修改。禁止通过 Shell/搜索遍历其他项目、用户主目录、环境文件、数据库或凭据文件寻找令牌/邮箱域名；不自行拼生产 API 请求。域名自动查询失败时报告工具的 `discoveryError`，仅暂停需要新邮箱注册的条目，已有登录或 Google 登录可继续。
+
+## 必须保持的执行规则
+
+1. **幂等提交**：本条或同来源已有 `submitted` / `live`、`publishedUrl` 非空时，不认领、不再提交。同一来源对同一个推广网站只发布一次。最终提交已经发出却无法确认结果时，记为 `failed + manual_required`，不自动重试；无链、被转义的旧评论也不能成为再发一条的理由。
+2. **证据回写**：只有亲自检查公开、非预览、无需登录的页面，确认实际可点击链接及其目标地址，才能写 `live`。明确进入审核队列写 `submitted`。导航成功、表单清空、HTTP 200 均不能证明已上线。
+3. **租约与页面所有权**：只处理本次租约明确授予的 item。约每 30 秒保活；租约不确定或失效时停止新提交。每个页面操作都带明确 `page`，不同任务不抢同一页；OAuth 弹窗也必须先列出并确认引用。
+4. **范围来自用户**：沿用用户已经选择的批次、条目和执行模式，不重复要求批准日常步骤。取消选批次不能解释成选择推荐批次。发布授权不包含付费、绕过验证码、修改第三方无关内容或扩大 OAuth 权限。
+
+## 1. 确定批次、范围与模式
+
+用户输入 `/backlink-publish 123`、提供多个批次号，或从批次控制台发来明确列表时，按这些批次执行，跳过重复的批次选择。多个批次去重，按数字 ID 降序逐个执行；不要同时占用多个批次租约。第 2–4 节逐批执行（每批独立 claim / 核对 / release）；第 5 节的汇总、`tabs`、`status`、人工处理 `AskUserQuestion` 与 `bringToFront` 只在最后一个批次 release 之后执行一次，覆盖本次所有批次。任何批次仍在执行时不得 `bringToFront`。
+
+没有批次号时：
+
+1. `backlinks`：`{"action":"batch_list"}`。
+2. 用 ZCode 原生 **`AskUserQuestion`** 提供最近最多 4 个真实批次供选择，显示网站、待执行数、日期。可以多选；自定义输入由客户端提供，不伪造批次选项。只有 1 个批次时，第二项可设为“暂不执行”。没有可用批次时直接报告。
+3. 工具返回 `answers`，其键是问题的完整 `question` 文本。卡片取消、跳过、空回答或选择“暂不执行”时，不认领任何批次，报告“尚未选择执行批次”并结束本次发布流程。
+
+例如，以下 ID 和计数必须替换成刚读取的真实值：
+
+```json
+{
+  "questions": [
+    {
+      "question": "本次要执行哪些外链批次？",
+      "header": "执行批次",
+      "multiSelect": true,
+      "options": [
+        { "label": "批次 123 · 8 条", "description": "示例站点 A，待执行 8 条" },
+        { "label": "批次 122 · 3 条", "description": "示例站点 B，待执行 3 条" }
+      ]
+    }
+  ]
+}
+```
+
+对每个确定批次调用 `{"action":"batch_get","batchId":123}`，读取完整网站资料包、anchors、条目与发布记录。
+
+- **排除已发布**：`publishStatus` 为 `submitted` / `live`、`publishedUrl` 非空，以及同批次同 `sourceId` 的关联条目，作为“已有发布记录，未执行”单列。不要覆盖它们已有的结果。
+- **可执行范围**：本批次的待发布和 `retryable` 条目。“全部可执行”也不能覆盖去重与未知提交保护。`manual_required` 只有在用户已处理阻碍、核对之前是否提交并在后续新请求中明确选择条目后才能再次认领。
+- **智能匹配（推荐）**：勘察后能匹配六类 playbook 才发布；未知类型写 `skipped`，`skipReason` 为“类型不识别，智能匹配模式下跳过”。
+- **全部尝试**：已知类型仍用 playbook；未知类型走通用单条目流程，不因为类型未知而跳过。
+
+读取全部所选批次详情后，**每次交互式发布都必须调用一次 ZCode 原生 `AskUserQuestion`，并在同一次调用中同时显示下面两个问题**。批次号只确定批次，不能解释为用户已选择范围或模式；侧栏按钮、单批、批量和带参数的 `/backlink-publish` 都不得跳过。描述中的真实数量必须根据刚读取的详情填写，不能照抄示例数字。
+
+```json
+{
+  "questions": [
+    {
+      "question": "本次执行哪些条目范围？",
+      "header": "执行范围",
+      "multiSelect": false,
+      "options": [
+        {
+          "label": "全部可执行（推荐）",
+          "description": "处理待发布与可重试失败；排除已发布、重复来源和待人工核对条目。需要手选时使用客户端自带的“其他”，输入逗号分隔的条目 ID。"
+        },
+        {
+          "label": "仅待发布",
+          "description": "只处理当前 pending 条目；排除失败记录、已发布、重复来源和待人工核对条目。"
+        }
+      ]
+    },
+    {
+      "question": "本次采用哪种执行模式？",
+      "header": "执行模式",
+      "multiSelect": false,
+      "options": [
+        {
+          "label": "智能匹配（推荐）",
+          "description": "只发布能匹配现有六类 playbook 的站点，未知类型如实跳过。"
+        },
+        {
+          "label": "全部尝试",
+          "description": "已知类型使用 playbook，未知类型也进入通用发布流程。"
+        }
+      ]
+    }
+  ],
+  "metadata": { "source": "backlink-publish" }
+}
+```
+
+回答映射与准入规则：
+
+- “全部可执行（推荐）”选择 `pending` 与 `failed + retryable`；“仅待发布”只选择 `pending`。
+- 执行范围的自定义回答必须能解析成当前所选批次中的正整数 item ID，按原批次归属和实际可执行状态求交集；不得把另一个批次、已发布或重复来源条目纳入。`manual_required` 条目仅当用户在本次新请求中按 ID 明确要求重试、并确认阻碍已处理时才可纳入；认领前必须先 `batch_get` 确认该条目仍无 `submitted` / `live` / `publishedUrl`，并按 [状态模型](references/status-model.md) 核对站点公开页、站内记录或邮件，确认之前未提交。任何一项无法确认的条目排除并单列原因，不认领。两个固定选项永远不纳入 `manual_required` 条目。
+- “智能匹配（推荐）”映射为 smart；“全部尝试”映射为 all。同一次批量发布的已确认范围规则与模式应用于全部所选批次，逐批计算真实 item ID。
+- 两项回答都存在且可解析之前，不得调用 `batch_claim`、不得创建邮箱、不得启动浏览器发布或产生任何第三方写操作。取消、跳过、空回答、未知选项、自定义 ID 为空或失效时，报告“尚未完成执行范围与模式选择”并结束本次流程；不能采用默认值继续。
+- `AskUserQuestion` 不可用时停止并报告交互能力缺失，不能改用普通文本提问后先行认领。用户回答后若后台状态已变化，重新只读获取详情并按相同答案收窄；候选为空时报告并结束，不扩大范围。
+
+## 2. 认领与保活
+
+调用 `{"action":"batch_claim","batchId":123,"itemIds":[1001,1002]}`；`itemIds` 来自本次选择并去除已发布项。省略 `itemIds` 表示服务端默认待发布和可重试范围，不等于全部强制执行。仅以返回租约授予的条目作为执行清单，记下真实 `leaseId`。
+
+- 主任务拥有租约生命周期。分派前先约每 30 秒调用 `{"action":"lease_heartbeat","leaseId":900}`；子代理运行期间由各活跃子代理通过受限 `backlinks_worker` 续租同一 lease。并发和串行使用相同的时间规则，不能按“每完成几个条目”计时。
+- 长时间浏览器等待、收邮件或人工处理不能阻塞保活。持有租约时把单次邮件等待缩短至例如 `waitTimeoutMs:20000`，有界分段等待之间保活；总计默认最多等 120 秒。不要在一次 120 秒阻塞调用期间假定租约仍然有效。
+- `LEASE_CONFLICT` 遵循服务端 `Retry-After`，不抢占别人的租约。保活失败或 `LEASE_NOT_ACTIVE` 时停止新提交，先读取批次核对结果；不能不核对就重新 claim 并重放提交。
+- 全部条目结束或用户取消时，由主任务调用 `{"action":"lease_release","leaseId":900}`。先让正在运行的子任务停止新操作并核对未知提交，不能在仍有发布动作时提前释放。释放失败如实报告，不声称已释放。
+
+## 3. 选择执行方式
+
+认领成功后，**每次实际发布都必须通过 ZCode 原生 `Agent` 调用专用 `backlinks:backlink-publisher` 子代理**；即使只有一个 item，也不能由主任务直接操作目标网站。若 `Agent` 或该 profile 不可用，在认领前停止并报告能力缺失，不能静默退回主任务发布。
+
+按标准化后的 `sourceHost` 建立队列，并使用**最多 3 个并发槽**滚动调度：
+
+1. 一个子代理一次只分配一个 item 和一个 `batch-{batchId}-item-{itemId}` 独占页面。
+2. 不同 `sourceHost` 可同时占用槽位；同一 host 只有前一项完成并核对终态后才能分派下一项。
+3. 同 `sourceId`、同推广网站、共享 Google OAuth、邮箱收件上下文或其他账号状态的条目强制进入同一串行队列。
+4. 某个子代理结束后立刻从尚未运行的不同 host 队列补位，直到全部队列排空；不能一次启动无限数量子代理。
+5. 主任务只负责范围、认领、队列、等待、终态核对与释放。子代理使用受限 `backlinks_worker` 续租和回写，不能查询、认领或释放批次。
+
+原生工具调用形状是：
+
+```json
+{
+  "description": "发布条目 1001",
+  "subagent_type": "backlinks:backlink-publisher",
+  "run_in_background": true,
+  "prompt": "完整、自包含的单条目任务说明，包含下面列出的约束和真实条目数据。"
+}
+```
+
+同一轮可并列发出最多 3 个 `Agent` 工具调用，使不同 host 真正并发。`Agent` 返回后台任务信息，完成后通知主任务。不要调用不存在的 `subagent` / `Subagent` 工具，不要使用 `general-purpose`，也不要添加 `model`、`action` 字段。主任务记录所有 agentId 与 itemId 的映射，在全部已启动任务返回前不得 release。
+
+每个子任务提示词必须带上：
+
+- 执行模式、完整网站资料包与 anchors、**唯一一个** item 的信息（id / sourceId / sourceUrl / submitUrl / sourceHost / category / tags / sourceNotes / 状态 / publishedUrl），真实 `leaseId`、唯一允许执行的 item ID 和独占页面名。
+- 本技能的幂等、证据、租约规则，以及对应 playbook 的完整相关内容；`navigate` 指定独占页，之后所有页面动作都带该页。Google 会话检查使用与条目绑定的 `batch-{batchId}-item-{itemId}-google` 页（不用保留给用户的 `google-session`），OAuth 弹窗使用 `tabs` 返回的实际页引用，不抢其他组的页面。
+- 找不到评论区前完成懒加载探测；根据实际编辑器能力选择 Website、富文本链接或明确支持的 HTML / BBCode，不向富文本框直接输入 HTML。
+- 可自助邮箱注册；当前生产部署必须使用 `backlinks_status` 返回的显式 `screwdom.org` 配置，不能退回 Cloud Mail 域名列表首项。验证码链接先核对站点和邮箱上下文；Google 密码与二次验证只由用户输入。
+- 一次最终提交；结果未知或正文 HTML 被转义写 `failed + manual_required`，不重发。公开核验等页面工作全部在 `item_result` 之前完成；每条立即 `item_result`，然后按观察 `source_tags`。成功回写后条目页会被自动回收、页面名失效，不再对它执行页面动作。
+- 先用 `backlinks_worker` 保活；邮件等待拆成最多 20 秒的区段并在区段之间保活。不自行 claim、release、不改主任务的范围、不另开用户问题。发现人工阻碍时先写 `failed + manual_required`（`failureReason` 与 evidence 说明具体阻碍），再对独占页调用 `hold` 并报告；不调用 `bringToFront`、`closePage` 或全局 `close`。失去租约或收到取消后停止新的副作用。
+
+每个子代理返回后，主任务用 `batch_get` 核对该 item 的真实后台终态和 `publishRecordId`，不能只凭子代理文本或工具 completed 声称成功。若子代理异常退出且后台没有终态，先判断最终提交是否可能已经发生：确定未提交才可写 `failed + retryable`；不确定则写 `failed + manual_required`。所有队列排空并完成核对后再 release；release 后汇总 `live`、`submitted`、失败、跳过与人工项。
+
+## 4. 单条目流程
+
+### 4.1 发布前查重
+
+重新核对 item 和同来源记录。已提交、已上线或已有 publishedUrl 的条目不进入站点提交。若租约授予后发现其他并行任务已完成，停止本项；按后端允许的当前状态回写，不能覆盖别人的成功记录。
+
+在目标站公开搜索/列表中检查目标网站域名和实际可点击链接。有真实旧链接可记 `skipped`（“目标站已存在本站链接，跳过重复发布”）。若只是转义文本或裸 URL，不应误称已发布，但仍需检查旧提交记录：此前确实提交过或结果未知时交人工核对，不能因此自动重发。已提交待审核项允许只读复核并在汇总报告新证据；后端不允许认领它时，不冒充持有租约修改记录。
+
+### 4.2 勘察与分类
+
+优先 `submitUrl`，其次 `sourceUrl`：
+
+```json
+{
+  "action": "navigate",
+  "page": "batch-123-item-1001",
+  "url": "https://directory.example/submit",
+  "waitUntil": "domcontentloaded"
+}
+```
+
+```json
+{ "action": "snapshot", "page": "batch-123-item-1001", "format": "aria", "maxChars": 18000 }
+```
+
+读实际页面再匹配 [目录](references/playbooks/playbook-directory.md)、[博客](references/playbooks/playbook-blog.md)、[论坛](references/playbooks/playbook-forum.md)、[内容](references/playbooks/playbook-article.md)、[游戏](references/playbooks/playbook-gaming.md)、[工具](references/playbooks/playbook-tools.md)。`category` 是提示，冲突时以页面为准并记录原因。
+
+判断“无评论区/无入口”前，依次检查 `#comments`、`#respond`、`#commentform`、`[id*='comment']`、`iframe` 等真实锚点（`waitFor` 设置例如 5000 毫秒的上限），`press` End / PageDown 后重新快照，点击真实存在的 Load comments / 展开按钮，检查 iframe 内容，必要时导航到当前 URL 的 `#comments`。每步都带同一 `page`；iframe 可能与评论无关，应根据页面结构识别，不能把所有 iframe 当成评论。全部探测仍无入口才写 `skipped`：“评论区延迟加载探测后仍不存在”。
+
+选择器优先使用快照中的 `role:button|Create Account`、`label:Email`、`placeholder:you@example.com`、`text:Sign in`，CSS 兜底。iframe 使用 `frame(iframe选择器)>>内部选择器`，支持嵌套；截图后的 `xy:120,240` 仅用于 `click`。
+
+### 4.3 注册与登录
+
+- 已登录：复用设置选定的浏览器登录态；CDP 模式使用新的独占页面，不修改或关闭 `owned:false` 的原有页面。
+- 有邮箱注册：先确认 `backlinks_status.mailbox.defaultDomain` 为 `screwdom.org`，再调用 `{"action":"mailbox_create","localPart":"agent-7f42a1","domain":"screwdom.org"}`；localPart 每次生成唯一的字母/数字前缀。使用返回的真实邮箱注册，再调用 `{"action":"mail_wait","mailEmail":"agent-7f42a1@example.test","subjectContains":"Verify","waitTimeoutMs":20000}` 等待验证码或验证链接；示例 mailEmail 必须换成工具实际返回的邮箱，过滤条件按真实站点选择，避免错取其他邮件。
+- 有 Google OAuth：按 [Google 会话指南](references/google-session.md) 检查会话、选择明确弹窗并继续。若 Google 登录未就绪但站点同时提供邮箱注册，可走邮箱路径；仅 Google 且未就绪时 `manual_required`。
+- CAPTCHA、设备验证或注册被拒：回写 `failed + manual_required` 记人工阻碍，再调用 `{"action":"hold","page":"batch-123-item-1001","reason":"CAPTCHA"}` 保留页面，留到批次结束统一处理；发布过程中不 `bringToFront`。普通“需要登录”不等于人工事件；先完成可用的常规注册流程。
+
+### 4.4 准备资料、填表和提交
+
+优先用 batch 的 website 提交资料包：`shortDescription`、`longDescription`、`logoUrl`、`screenshotUrl`、`keyFeatures`、`pricingType` 及核心名称和 URL。文案按站点长度与语言调整，事实不杜撰；证据注明“使用后台资料包”。仅缺失项才从推广网站公开资料获取，注明“该项自获取”；必要且无法获取时交用户提供。
+
+上传前把有权使用的素材下载到当前工作区的真实文件。`upload` 的 `files` 接受工作区内绝对路径或工作区相对路径，不能直接传 URL、外部文件路径或指向工作区外的符号链接。不能为了上传复制个人 Cookie、浏览器 profile 或其他敏感文件。
+
+锚文本与 targetUrl 从实际返回的 anchors 选用；若提供启用标记则优先启用项，否则使用列表中的实际可用项，不臆造 active 字段。带链方式：
+
+- Website 字段可携带目标链接时优先填字段，正文写与页面相关的观点。
+- `contenteditable` 或富文本工具栏：先输入内容，通过实际提供的插入链接/选中文字等界面操作建立链接，不能将 `<a>` 作为文本填入。
+- HTML / BBCode：只有页面说明或已核验先例确认支持时使用相应格式。纯文本框本身不证明支持 HTML；没有可确认的带链方式就跳过，不能发布试探性无链评论。
+- 一段评论或一篇投稿一般只放一个目标链接；内容须与文章、版块或目录真实相关，遵守目标站规则。
+
+提交前快照复查 URL、分类、文案、定价与图片。对明确的最终提交按钮只执行一次。网络或工具错误若标为 `sideEffect:"uncertain"`，或无法判断点击是否生效，立即进入人工核对路径，不再点一次。
+
+### 4.5 互链徽标（要求时，在最终提交前）
+
+1. 从目标站实际徽标区获取官方 HTML，核对链接目标与内容；先检查己方公开页面是否已挂上，已有则复用。
+2. 用真实 websiteId 调用 `{"action":"badge_add","websiteId":50,"name":"目标目录名称","html":"实际核对过的徽标 HTML","isActive":true}`。
+3. 检查返回的 `callbackTriggered` 等结果，但它不证明公开页已经更新。刷新/抓取己方公开页面，核验徽标实际链接和目标域名；可有界检查最多 3 次，间隔约 5 秒，并保持租约。
+4. 回调由后端按己方网站已配置的机制执行。不猜测 `/footer/refresh`、不拼接未经确认的回调地址，也不照搬源环境地址。如果公开页没有更新，只有在用户已有授权且后台或项目配置明确提供实际刷新机制时才能使用该机制；否则记“徽标已入库但公开页面未更新”，交人工处理。
+5. 确认公开徽标生效后，才回目标站执行 Verify Backlink / 最终提交。
+
+### 4.6 核验、回写与来源标签
+
+提交后读回执，再检查公开列表页/详情页。使用独立验证页可保留原表单，验证页必须命名为 `batch-{batchId}-item-{itemId}-verify`（后缀可用 `-` / `_` / `/` 分隔），使其与条目绑定、随条目回收或 held；每个动作明确 `page`。所有页面核验必须在 `item_result` 之前完成：回写成功后，`live` / `submitted` / `skipped` / `failed + retryable` 条目的弹窗关闭、页面自动回收，页面名失效（再操作返回 `BROWSER_PAGE_NOT_FOUND`）；`failed + manual_required` 条目的页面自动 held 保留。ARIA 中真实 link 的名称要与锚文本相符，且实际 href 必须指向目标 URL（见 [证据指南](references/evidence.md)）；不能仅看文字中出现 URL。
+
+结果使用 `backlinks` 的 `item_result`，共同参数为 `itemId`。租约上下文用来确认该 item 属于本次已领取范围；运行时维护条目与租约的关联，`item_result` 的实际 schema 不接受 `leaseId`，不要把它作为额外字段传入。只有 `lease_heartbeat` / `lease_release` 传 `leaseId`：
+
+| 状态        | 必需结果字段                                | 适用情形                                                                         |
+| ----------- | ------------------------------------------- | -------------------------------------------------------------------------------- |
+| `live`      | `publicUrl`、`anchorText`、`targetUrl`      | 公开页已核验实际目标链接                                                         |
+| `submitted` | `anchorText`、`targetUrl`；`publicUrl` 可选 | 有明确提交成功/待审回执                                                          |
+| `failed`    | `failureMode`、`failureReason`              | `retryable` 仅用于可确定未提交的瞬时失败；人工阻碍或提交未知用 `manual_required` |
+| `skipped`   | `skipReason`                                | 查重、付费、规则不允许、资格不符或当前模式排除                                   |
+
+`live` / `submitted` / `failed` 可附 `evidence`；`skipped` 将事实写入 `skipReason`，不要添加该结果分支不接受的字段。正文 HTML 被转义说明目标链接没有生效，记 `failed + manual_required`，禁止重发。后台 `item_result` 响应未知时先 `batch_get` 核对，不能重做第三方网站提交。详见 [状态模型](references/status-model.md)。
+
+回写后按本次实际观察调用 `{"action":"source_tags","sourceId":156,"tags":["免徽章","可复用"]}`；每次 1–10 个非空标签，只增不删：
+
+| 标签     | 条件                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------- |
+| `免徽章` | 可免费提交且未要求互挂徽章                                                               |
+| `要徽章` | 要求互链徽标或验证                                                                       |
+| `可复用` | 此次结果为 `live` 或 `submitted`，表示来源今后可用于其他符合条件的网站，不是同站再次提交 |
+| `有盾`   | 实际遇到 Cloudflare / Turnstile 质询，无论是否通过                                       |
+| `付费`   | 付费是唯一提交方式；有免费渠道时不因付费加速选项打此标签                                 |
+
+结果回写与打标分别核对成功；标签失败不撤销已成功回写的发布结果，不重新发布。在本次汇总记录新增标签和未完成的后台操作。
+
+## 5. 完成与人工恢复
+
+主任务核对每条结果、停止子任务并 `lease_release` 之后，输出中文表格：批次 / 条目 / 来源 / live、submitted、failed、skipped / 公开 URL 或具体原因；另外列出未认领的已有发布记录、人工阻碍、回写或 release 失败。不能把“后台已收到结果”写成“公开链接已上线”。
+
+汇总后调用一次 `{"action":"tabs"}`。只统计本次运行已领取条目的 held 页：`held:true`，且 `itemId` 属于本次运行中各批次租约实际授予的条目（页名为 `batch-{batchId}-item-{itemId}` 或其弹窗）。本次运行以外的批次、并发任务或更早保留的 held 页不计数、不询问、不显示。每页的具体阻碍取该条目所属批次 release 前最后一次 `batch_get` 中的 `failureReason`；`holdReason` 可能是自动保留的 `manual_required` 或子代理 `hold` 时给出的原因，只作参考，不能代替 `failureReason`。
+
+若本次运行有 held 页，先调用 `{"action":"status"}`。`displayMode` 为 `headless` 时不提供“现在逐个处理”、不调用 `AskUserQuestion` 或 `bringToFront`：列出这些条目与 `failureReason`，然后对本次运行的每个 held 页调用一次 `closePage`（无头页面无法转为可见，保留没有意义，还会让新的显示设置无法生效）。说明无头模式没有可交互窗口；请用户先记录上述条目与 `failureReason`（不确定是否已提交的条目应先到站点核实），把外链设置切换为 `background` 或 `visible`。浏览器没有任何页面时，下一次使用会按新设置重新启动；之后在新请求中按 ID 重试这些 `manual_required` 条目。否则调用一次 `AskUserQuestion`，数量按本次运行实际 held 页填写：
+
+```json
+{
+  "questions": [
+    {
+      "question": "有 2 个页面需要人工处理，现在处理吗？",
+      "header": "人工处理",
+      "multiSelect": false,
+      "options": [
+        {
+          "label": "现在逐个处理",
+          "description": "依次把保留的页面显示到前台，由你在浏览器中完成。"
+        },
+        {
+          "label": "稍后处理",
+          "description": "页面最长保留 24 小时，之后可在新请求中重试这些条目。"
+        }
+      ]
+    }
+  ],
+  "metadata": { "source": "backlink-publish" }
+}
+```
+
+- 选择“现在逐个处理”：依次对本次运行每个 held 页调用 `{"action":"bringToFront","page":"batch-123-item-1001"}`，并列出对应条目与 `failureReason`。显示后只由用户在浏览器中操作：租约已释放，主任务不在这些页面填写、点击、提交，也不为它们写 `item_result`；需要重试时由用户在新请求中明确提出。告诉用户处理完可直接关闭这些标签；显示中的页面不影响之后批次的后台运行（新任务使用另一个停靠窗口）。
+- 选择“稍后处理”、取消或空回答：说明页面最长保留 24 小时，这些 `manual_required` 条目可在之后的新请求中明确选择后重试；不调用 `bringToFront`。
+- 本次运行没有 held 页时不提问。
+
+批次结束不调用全局 `close`；页面按条目结果与空闲时间自动回收，不需要 `closePage`。登录态由宿主按工作区身份保存，通常可供之后复用，但会过期；不能承诺所有站点自动登录。用户完成 CAPTCHA / 登录后，仅重试已明确选择且确认未提交的条目。重试前可先用 `tabs` / `snapshot` 只读查看仍保留的旧页面；重试条目的第一次 `navigate` 会结束旧页面的保留并在新的停靠页面中开始（登录态保存在 profile 中）。
+
+用户只要求“初始化/检查 Google 会话”时，改用 [google-session](../google-session/SKILL.md)，不认领批次。
+
+补充：[授权与频控](references/safety.md) · [状态模型](references/status-model.md) · [证据标准](references/evidence.md)。
+
+## 来源与修改说明
+
+由 [javawl/link-harness tag 2.0.0](https://github.com/javawl/link-harness/tree/2.0.0/examples/backlink-agent/skills) 的同名技能及全部 10 篇参考指南改编，MIT，Copyright (c) 2026 DeepSeek。适配 ZCode MCP、`AskUserQuestion` / `Agent`、工作区隔离浏览器、可配置邮箱、回调核验和不重复提交规则；源许可全文见 [浏览器说明中的许可](../../docs/browser.md#来源与许可)。

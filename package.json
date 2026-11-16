@@ -1,0 +1,17 @@
+{
+  "name": "zcode-backlinks-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Standalone ZCode plugin for backlink publishing: MCP tools, a persistent browser, and publishing skills. Extracted from the ZCode-Link fork so official ZCode installs it without any harness patching.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm --filter @zcode/backlinks-plugin build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "oxlint": "^1.57.0"
+  }
+}

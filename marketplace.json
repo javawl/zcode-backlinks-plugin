@@ -1,0 +1,18 @@
+{
+  "name": "dev-zcode-backlinks-plugin-0a277f9f",
+  "plugins": [
+    {
+      "name": "backlinks",
+      "source": "./packages/backlinks",
+      "version": "0.2.0",
+      "description": "Publish and verify backlink batches with Supermanager, verification mail, a persistent browser, and platform playbooks.",
+      "displayName": "Backlinks Publisher",
+      "displayName_i18n": {
+        "zh-CN": "外链发布"
+      },
+      "description_i18n": {
+        "zh-CN": "外链批次发布与核验：Supermanager 批次租约、Cloud Mail 验证邮箱、持久 Chrome 浏览器与六类站点剧本。"
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "backlinks",
+  "version": "0.2.0",
+  "description": "Publish and verify backlink batches with Supermanager, verification mail, a persistent browser, and platform playbooks.",
+  "author": { "name": "javawl" },
+  "license": "MIT",
+  "agents": "agents",
+  "skills": "skills",
+  "commands": "commands",
+  "mcpServers": {
+    "backlinks": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${ZCODE_PLUGIN_ROOT}/dist/mcp/server.js"],
+      "cwd": "${ZCODE_PROJECT_DIR}",
+      "isolation": "workspace",
+      "timeoutMs": 300000,
+      "env": { "ZCODE_PROJECT_DIR": "${ZCODE_PROJECT_DIR}" }
+    }
+  }
+}
